@@ -39,8 +39,9 @@ def run_cli(cwd, *args, env_extra=None):
 class FakeAI:
     """OpenAI 호환 / Anthropic 형식 응답을 흉내 내는 로컬 서버."""
 
-    def __init__(self, reply="feat: 테스트\n\n- 본문", status=200, style="openai"):
-        self.reply, self.status, self.style = reply, status, style
+    def __init__(self, reply="feat: 테스트\n\n- 본문", status=200, style="openai", finish="stop", usage=None):
+        self.reply, self.status, self.style, self.finish = reply, status, style, finish
+        self.usage = usage or {"prompt_tokens": 100, "completion_tokens": 20}
         self.requests = []
         outer = self
 
@@ -56,8 +57,8 @@ class FakeAI:
                                        "usage": {"input_tokens": 100, "output_tokens": 20}}).encode()
                 else:
                     data = json.dumps({"model": body["model"],
-                                       "choices": [{"message": {"content": outer.reply}, "finish_reason": "stop"}],
-                                       "usage": {"prompt_tokens": 100, "completion_tokens": 20}}).encode()
+                                       "choices": [{"message": {"content": outer.reply}, "finish_reason": outer.finish}],
+                                       "usage": outer.usage}).encode()
                 self.send_response(outer.status)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()

@@ -10,6 +10,9 @@ from typing import Any, Dict, Optional
 
 from . import __version__, ai_client, git_collector, postprocess, prompts, safe_mode
 
+# ====================================================================
+# [1] 기본 설정값
+# ====================================================================
 CONFIG_FILE = ".ai-gitgen.json"
 
 DEFAULTS: Dict[str, Any] = {
@@ -24,9 +27,12 @@ DEFAULTS: Dict[str, Any] = {
     "max_lines": 200,
     "base": None,
     "base_url": None,
+    "reasoning_effort": None,   # None → 제공자 기본값 (gemini: low, 그 외: 보내지 않음)
 }
 
-# ── 출력 도우미 ───────────────────────────────────────────────
+# ====================================================================
+# [2] 터미널 출력 도우미 — 로그([INFO]/[DONE]/[WARN]/[ERROR]) · 블록 · 구분선
+# ====================================================================
 _COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 _C = {"INFO": "36", "DONE": "32", "WARN": "33", "ERROR": "31", "dim": "2", "bold": "1"}
 
@@ -49,7 +55,9 @@ def rule() -> None:
     print(_c("bold", "-" * 40))
 
 
-# ── 설정 ─────────────────────────────────────────────────────
+# ====================================================================
+# [3] 설정 — 설정 파일 읽기 + 기본값/설정파일/환경변수/CLI 옵션 병합
+# ====================================================================
 def load_config(path: Optional[str]) -> Dict[str, Any]:
     p = Path(path or CONFIG_FILE)
     if not p.exists():
@@ -81,6 +89,11 @@ def merge_settings(args: argparse.Namespace, cfg: Dict[str, Any]) -> Dict[str, A
         raise SystemExit(f"[ERROR] 지원하지 않는 provider: {s['provider']} "
                          f"(가능: {', '.join(ai_client.PROVIDERS)})")
     s["model"] = s["model"] or ai_client.PROVIDERS[s["provider"]]["default_model"]
+    # 생각(thinking) 분량: 지정 안 하면 제공자 기본값, "off" 면 요청에 아예 넣지 않음
+    if s["reasoning_effort"] is None:
+        s["reasoning_effort"] = ai_client.PROVIDERS[s["provider"]].get("default_reasoning_effort")
+    elif s["reasoning_effort"] == "off":
+        s["reasoning_effort"] = None
     if not 0 <= float(s["temperature"]) <= 2:
         raise SystemExit("[ERROR] --temperature 는 0 ~ 2 사이여야 합니다.")
     if int(s["max_tokens"]) <= 0:
@@ -88,7 +101,9 @@ def merge_settings(args: argparse.Namespace, cfg: Dict[str, Any]) -> Dict[str, A
     return s
 
 
-# ── 인자 ─────────────────────────────────────────────────────
+# ====================================================================
+# [4] CLI 인자 정의 — commit / pr 명령과 옵션
+# ====================================================================
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     g = common.add_argument_group("AI API 파라미터")
@@ -98,6 +113,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--max-tokens", type=int, dest="max_tokens", help="최대 출력 토큰 (기본: 2048)")
     g.add_argument("--timeout", type=float, help="요청 타임아웃 초 (기본: 60)")
     g.add_argument("--base-url", dest="base_url", help="OpenAI 호환 API 주소 직접 지정 (선택)")
+    g.add_argument("--reasoning-effort", dest="reasoning_effort", choices=["none", "low", "medium", "high", "off"],
+                   help="추론 모델의 생각 분량 (기본: gemini=low, 그 외 off=보내지 않음)")
 
     p = common.add_argument_group("입력/출력")
     p.add_argument("--context", "-c", help="변경 이유/요구사항을 AI에게 함께 전달 (품질↑)")
@@ -126,7 +143,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# ── 실행 ─────────────────────────────────────────────────────
+# ====================================================================
+# [5] 메인 실행 흐름 — 수집 → 안전 모드 → 프롬프트 → AI 호출 → 검증 → 출력
+# ====================================================================
 def run(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -137,7 +156,7 @@ def run(argv=None) -> int:
         if args.config or Path(CONFIG_FILE).exists():
             log("INFO", f"설정 파일 적용: {args.config or CONFIG_FILE}")
 
-        # 1) Git 수집
+        # --- 5-1. Git 변경 수집 (status / diff) + 변경 없음 처리 ---
         if args.command == "commit":
             ch = git_collector.collect_for_commit()
         else:
@@ -152,7 +171,7 @@ def run(argv=None) -> int:
             log("INFO", f"변경 사항이 없습니다. {what} 생성하지 않고 종료합니다.")
             return 0
 
-        # 2) 안전 모드
+        # --- 5-2. 안전 모드 적용 (마스킹 · 전송 제한) ---
         diff, rep = safe_mode.apply(ch.diff, enabled=st["safe_mode"], max_files=st["max_files"],
                                     max_lines=st["max_lines"], extra_patterns=cfg.get("mask_patterns"))
         log("INFO", f"안전 모드: {'ON' if rep.enabled else 'OFF'}")
@@ -161,9 +180,9 @@ def run(argv=None) -> int:
         if not rep.enabled:
             log("WARN", "안전 모드가 꺼져 있어 diff 원문이 그대로 전송됩니다. 민감정보가 없는지 확인하세요.")
 
-        # 3) 프롬프트
+        # --- 5-3. 프롬프트 만들기 (+ --dry-run 이면 여기서 종료) ---
         build = prompts.build_commit_prompt if args.command == "commit" else prompts.build_pr_prompt
-        system, user = build(ch, diff, conv, st["lang"], args.context)
+        system, user = build(ch, diff, conv, st["lang"], args.context, rep.omitted_note())
 
         if args.dry_run or args.show_prompt:
             block("System Prompt", system)
@@ -174,33 +193,39 @@ def run(argv=None) -> int:
                         f"프롬프트 약 {len(system) + len(user):,}자)")
             return 0
 
-        # 4) AI 호출 (정확히 1회)
+        # --- 5-4. AI API 호출 (정확히 1회) ---
         req = ai_client.AIRequest(
             provider=st["provider"], model=st["model"], system=system, user=user,
             temperature=float(st["temperature"]), max_tokens=int(st["max_tokens"]),
             timeout=float(st["timeout"]), base_url=st["base_url"],
+            reasoning_effort=st["reasoning_effort"],
         )
         ai_client.resolve_api_key(req.provider)  # 키 누락은 요청 전에 바로 알림
         log("INFO", f"AI API 요청 중... ({req.provider} / {req.model}, temperature={req.temperature}, "
-                    f"max_tokens={req.max_tokens})")
+                    f"max_tokens={req.max_tokens}"
+                    + (f", reasoning_effort={req.reasoning_effort}" if req.reasoning_effort else "") + ")")
         resp = ai_client.call(req)
         tok = resp.usage
         what = "커밋 메시지" if args.command == "commit" else "PR 초안"
-        log("DONE", f"{what} 생성 완료 ({resp.elapsed:.1f}s, 토큰 입력 {tok.get('input')} / 출력 {tok.get('output')})")
+        think = f" / 생각 {tok['reasoning']}" if tok.get("reasoning") else ""
+        log("DONE", f"{what} 생성 완료 ({resp.elapsed:.1f}s, 토큰 입력 {tok.get('input')} / 출력 {tok.get('output')}{think})")
         log("INFO", "AI API 호출 횟수: 1")
-        if resp.finish_reason in ("length", "max_tokens"):
-            log("WARN", "응답이 max_tokens 에서 잘렸을 수 있습니다. --max-tokens 를 늘려 보세요.")
+        truncated = resp.finish_reason in ("length", "max_tokens", "MAX_TOKENS")
+        if truncated:
+            log("WARN", "응답이 max_tokens 에서 잘렸습니다. 끊긴 마지막 줄은 버리고 보여줍니다. "
+                        "--max-tokens 를 늘리거나 --reasoning-effort none 을 써 보세요.")
 
-        # 5) 검증 + 후처리
+        # --- 5-5. 검증 + 후처리 → 결과 메시지 출력 ---
         if args.command == "commit":
-            res = postprocess.process_commit(resp.text, recommended=conv.subject_max)
+            res = postprocess.process_commit(resp.text, recommended=conv.subject_max, truncated=truncated)
             block("Commit Message", res.text)
         else:
-            res = postprocess.process_pr(resp.text)
+            res = postprocess.process_pr(resp.text, truncated=truncated)
             block("PR Title", res.title)
             block("PR Body", res.body)
         rule()
 
+        # --- 5-6. 검증 결과 출력 (✔ / ⚠ / ↺) ---
         print(_c("bold", "[CHECK] 형식 검증"))
         for c in res.checks:
             mark = _c("DONE", "✔") if c.ok else _c("WARN", "⚠")
@@ -208,6 +233,7 @@ def run(argv=None) -> int:
         for f in res.fixes:
             print(f"  {_c('INFO', '↺')} 후처리: {f}")
 
+        # --- 5-7. 파일 저장 (-o) ---
         if args.output:
             content = res.text if args.command == "commit" else f"{res.title}\n\n{res.body}"
             Path(args.output).write_text(content + "\n", encoding="utf-8")
@@ -217,6 +243,7 @@ def run(argv=None) -> int:
         print(_c("dim", "\n※ AI 초안입니다. 반드시 검토·수정 후 사용하세요."))
         return 0
 
+    # --- 5-8. 예외 처리 — 원인 메시지 출력 후 종료 코드 반환 ---
     except git_collector.GitError as e:
         log("ERROR", str(e))
         return 1
@@ -230,5 +257,8 @@ def run(argv=None) -> int:
         return 130
 
 
+# ====================================================================
+# [6] 프로그램 진입점
+# ====================================================================
 def main() -> None:
     sys.exit(run())

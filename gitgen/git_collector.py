@@ -10,10 +10,16 @@ from pathlib import Path
 from typing import List, Optional
 
 
+# ====================================================================
+# [1] 예외 정의
+# ====================================================================
 class GitError(Exception):
     """Git 실행/환경 문제."""
 
 
+# ====================================================================
+# [2] git 명령 실행 도우미 — subprocess 로 실행하고 실패 시 GitError
+# ====================================================================
 def run_git(args: List[str], cwd: Optional[str] = None, ok_codes=(0,)) -> str:
     try:
         proc = subprocess.run(
@@ -32,6 +38,9 @@ def run_git(args: List[str], cwd: Optional[str] = None, ok_codes=(0,)) -> str:
     return proc.stdout
 
 
+# ====================================================================
+# [3] 데이터 구조 — 변경 파일 1개 / 수집 결과 전체
+# ====================================================================
 @dataclass
 class FileChange:
     status: str  # 예: "M", "A", "D", "R", "??"
@@ -64,6 +73,9 @@ class Changes:
         return not self.files and not self.diff.strip()
 
 
+# ====================================================================
+# [4] 저장소 확인 — 루트 위치 · 현재 브랜치 · 커밋 존재 여부
+# ====================================================================
 def ensure_repo_root(cwd: Optional[str] = None) -> Path:
     """Git 저장소의 루트에서 실행 중인지 확인한다."""
     try:
@@ -93,6 +105,9 @@ def has_commits(cwd: Optional[str] = None) -> bool:
         return False
 
 
+# ====================================================================
+# [5] git status 수집 · 파싱 — 변경 파일 목록
+# ====================================================================
 def parse_status(porcelain: str) -> List[FileChange]:
     """`git status --porcelain=v1` 출력을 파싱한다."""
     files: List[FileChange] = []
@@ -116,6 +131,9 @@ def collect_status(cwd: Optional[str] = None) -> List[FileChange]:
     return parse_status(run_git(["status", "--porcelain=v1", "--untracked-files=all"], cwd=cwd))
 
 
+# ====================================================================
+# [6] 커밋용 diff 수집 — 스테이징 우선, 없으면 워킹트리 + 새 파일
+# ====================================================================
 def _untracked_diff(paths: List[str], cwd: Optional[str] = None) -> str:
     """새 파일은 git diff에 안 잡히므로 `git diff --no-index /dev/null <file>`로 내용을 얻는다."""
     chunks = []
@@ -150,6 +168,9 @@ def collect_for_commit(cwd: Optional[str] = None) -> Changes:
     )
 
 
+# ====================================================================
+# [7] PR용 diff 수집 — base 브랜치 탐지 + base...HEAD 비교
+# ====================================================================
 def detect_base(cwd: Optional[str] = None) -> Optional[str]:
     for cand in ("main", "master", "origin/main", "origin/master", "develop"):
         try:
@@ -168,6 +189,7 @@ def collect_for_pr(base: Optional[str] = None, cwd: Optional[str] = None) -> Cha
     diff, stat = "", ""
     files: List[FileChange] = []
 
+    # --- 7-1. 브랜치에서 커밋한 변경 (base...HEAD) ---
     if base and has_commits(cwd) and base != branch:
         try:
             diff = run_git(["diff", f"{base}...HEAD"], cwd=cwd)
@@ -186,6 +208,7 @@ def collect_for_pr(base: Optional[str] = None, cwd: Optional[str] = None) -> Cha
     else:
         notes.append("base 브랜치를 찾지 못해 워킹트리 변경만 사용합니다. (--base 로 지정 가능)")
 
+    # --- 7-2. 아직 커밋 안 한 변경 합치기 ---
     # 커밋 안 된 변경도 포함
     local = collect_for_commit(cwd)
     if local.diff.strip():

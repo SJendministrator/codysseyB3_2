@@ -18,6 +18,9 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+# ====================================================================
+# [1] 제공자 설정 — 어느 AI 서비스에, 어떤 주소/모델/키 이름으로 보낼지
+# ====================================================================
 PROVIDERS: Dict[str, dict] = {
     "gemini": {
         "style": "openai",
@@ -25,6 +28,9 @@ PROVIDERS: Dict[str, dict] = {
         "default_model": "gemini-2.5-flash",
         "key_env": "GEMINI_API_KEY",
         "key_url": "https://aistudio.google.com/apikey",
+        # 2.5 Flash는 답하기 전에 '생각(thinking)'을 하며 max_tokens를 같이 쓴다.
+        # low로 생각 분량을 제한해 답변이 잘리지 않게 한다. (none/low/medium/high)
+        "default_reasoning_effort": "low",
     },
     "openai": {
         "style": "openai",
@@ -43,6 +49,9 @@ PROVIDERS: Dict[str, dict] = {
 }
 
 
+# ====================================================================
+# [2] 데이터 구조 — 오류 / 요청 / 응답
+# ====================================================================
 class AIError(Exception):
     def __init__(self, message: str, hint: Optional[str] = None):
         super().__init__(message)
@@ -59,6 +68,7 @@ class AIRequest:
     max_tokens: int = 2048
     timeout: float = 60.0
     base_url: Optional[str] = None
+    reasoning_effort: Optional[str] = None   # None 이면 요청에 넣지 않음
 
 
 @dataclass
@@ -70,6 +80,9 @@ class AIResponse:
     elapsed: float = 0.0
 
 
+# ====================================================================
+# [3] API Key 읽기 — 환경변수에서만 (하드코딩 금지)
+# ====================================================================
 def resolve_api_key(provider: str) -> str:
     """AI_API_KEY 우선, 없으면 제공자별 환경변수(GEMINI_API_KEY 등)를 본다. 코드에 키를 두지 않는다."""
     key = os.environ.get("AI_API_KEY") or os.environ.get(PROVIDERS.get(provider, {}).get("key_env", ""), "")
@@ -84,11 +97,15 @@ def resolve_api_key(provider: str) -> str:
     return key
 
 
+# ====================================================================
+# [4] 요청 만들기 — URL · 헤더 · JSON 본문 조립
+# ====================================================================
 def _build_http_request(req: AIRequest, key: str) -> urllib.request.Request:
     p = PROVIDERS.get(req.provider, PROVIDERS["openai"])
     base = (req.base_url or p["base_url"]).rstrip("/")
     headers = {"Content-Type": "application/json", "User-Agent": "ai-gitgen/0.1"}
 
+    # --- 4-1. Anthropic Messages API 형식 ---
     if p["style"] == "anthropic":
         url = f"{base}/messages"
         headers.update({"x-api-key": key, "anthropic-version": "2023-06-01"})
@@ -100,6 +117,7 @@ def _build_http_request(req: AIRequest, key: str) -> urllib.request.Request:
             "temperature": req.temperature,
         }
     else:
+        # --- 4-2. OpenAI 호환 Chat Completions 형식 (gemini / openai) ---
         url = f"{base}/chat/completions"
         headers["Authorization"] = f"Bearer {key}"
         body = {
@@ -111,10 +129,17 @@ def _build_http_request(req: AIRequest, key: str) -> urllib.request.Request:
             "temperature": req.temperature,
             "max_tokens": req.max_tokens,
         }
+        # 추론(thinking) 모델의 생각 분량 — 지원하는 모델에만 보낸다 (gpt-4.1 계열은 미지원 → 400)
+        if req.reasoning_effort:
+            body["reasoning_effort"] = req.reasoning_effort
+    # --- 4-3. JSON 직렬화 → POST 요청 객체 ---
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     return urllib.request.Request(url, data=data, headers=headers, method="POST")
 
 
+# ====================================================================
+# [5] 오류 메시지 변환 — 응답 본문에서 원인 문장 꺼내기 + 상태코드별 안내
+# ====================================================================
 def _error_message(body: str) -> str:
     try:
         j = json.loads(body)
@@ -137,11 +162,16 @@ _HTTP_HINTS = {
 }
 
 
+# ====================================================================
+# [6] 호출 함수 — 전송 → 응답 파싱 → 예외 처리 (정확히 1회)
+# ====================================================================
 def call(req: AIRequest) -> AIResponse:
     """AI API를 정확히 1회 호출한다 (자동 재시도 없음 → 비용 예측 가능)."""
+    # --- 6-1. 요청 준비 ---
     key = resolve_api_key(req.provider)
     http_req = _build_http_request(req, key)
     t0 = time.monotonic()
+    # --- 6-2. 전송 + HTTP / 네트워크 / SSL / 타임아웃 예외 ---
     try:
         with urllib.request.urlopen(http_req, timeout=req.timeout) as resp:
             raw = resp.read().decode("utf-8")
@@ -160,6 +190,7 @@ def call(req: AIRequest) -> AIResponse:
         raise AIError(f"네트워크 오류: {reason}", hint="인터넷 연결, 프록시/방화벽, --base-url 주소를 확인하세요.")
     except (socket.timeout, TimeoutError):
         raise AIError(f"API 응답 시간 초과 ({req.timeout:.0f}초)", hint="--timeout 값을 늘리거나 네트워크를 확인하세요.")
+    # --- 6-3. 응답 JSON 파싱 ---
     elapsed = time.monotonic() - t0
 
     try:
@@ -167,6 +198,7 @@ def call(req: AIRequest) -> AIResponse:
     except json.JSONDecodeError:
         raise AIError(f"응답이 JSON이 아닙니다: {raw[:200]}")
 
+    # --- 6-4. 제공자별 응답 형식에서 텍스트·토큰 사용량 꺼내기 ---
     style = PROVIDERS.get(req.provider, PROVIDERS["openai"])["style"]
     try:
         if style == "anthropic":
@@ -180,15 +212,23 @@ def call(req: AIRequest) -> AIResponse:
             finish = choice.get("finish_reason")
             u = j.get("usage") or {}
             usage = {"input": u.get("prompt_tokens"), "output": u.get("completion_tokens")}
+            # 생각(thinking)에 쓴 토큰: 상세 필드가 있으면 그 값, 없으면 total - input - output 으로 추정
+            detail = (u.get("completion_tokens_details") or {}).get("reasoning_tokens")
+            if detail is None and u.get("total_tokens") and usage["input"] is not None and usage["output"] is not None:
+                detail = u["total_tokens"] - usage["input"] - usage["output"]
+            if detail:
+                usage["reasoning"] = detail
     except (KeyError, IndexError, TypeError):
         raise AIError(f"예상과 다른 응답 형식입니다: {raw[:300]}")
 
+    # --- 6-5. 빈 응답 검사 (thinking 모델의 max_tokens 소진 등) ---
     if not text.strip():
         hint = None
         if finish in ("length", "max_tokens", "MAX_TOKENS"):
             hint = ("max_tokens 를 다 써버렸습니다. 'thinking(추론)' 모델은 답변 전에 토큰을 쓰므로 "
-                    "--max-tokens 를 늘려 보세요 (예: 4096).")
+                    "--max-tokens 를 늘리거나 (예: 4096) --reasoning-effort none 을 써 보세요.")
         raise AIError(f"AI 응답이 비어 있습니다 (finish_reason={finish}).", hint=hint)
 
+    # --- 6-6. 결과 반환 ---
     return AIResponse(text=text, model=j.get("model", req.model), finish_reason=finish,
                       usage=usage, elapsed=elapsed)
