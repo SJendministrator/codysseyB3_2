@@ -101,7 +101,16 @@ gitgen commit --provider anthropic               # 다른 제공자
 
 ## 4. 출력 예시
 
-> 아래는 출력 형식 예시입니다. 실제 키로 실행한 화면은 `screenshots/`에 있습니다.
+### 실제 실행 화면 (Gemini `gemini-2.5-flash`)
+
+| `python3 main.py commit` | `python3 main.py pr` |
+|---|---|
+| <img src="screenshots/real-commit.png" width="420"> | <img src="screenshots/real-pr.png" width="420"> |
+
+- commit: `git add`한 파일만 수집 → API 1회 호출(5.6s, 입력 616 / 출력 57 토큰) → 형식 검증 5개 항목 모두 통과
+- pr: `main...HEAD` 차이 수집 → API 1회 호출(3.0s) → Why / What / How to Test 섹션과 불릿 검증 통과
+
+아래는 출력 형식을 텍스트로 옮긴 예시입니다.
 
 ### 커밋 메시지 (`python3 main.py commit`)
 
