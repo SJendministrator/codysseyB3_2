@@ -1,0 +1,23 @@
+{
+  "provider": "gemini",
+  "temperature": 0.3,
+  "max_tokens": 2048,
+  "lang": "ko",
+  "safe_mode": true,
+  "max_files": 10,
+  "max_lines": 200,
+  "mask_patterns": {
+    "INTERNAL_URL": "https?://[\\w.-]*\\.internal\\.[\\w./-]+"
+  },
+  "convention": {
+    "commit_types": ["feat", "fix", "docs", "refactor", "test", "chore"],
+    "scopes": ["git", "ai", "safe", "cli", "docs"],
+    "require_scope": false,
+    "subject_max": 50,
+    "include_body": true,
+    "extra_rules": ["관련 이슈가 있으면 제목 끝에 (#번호)를 붙인다"],
+    "pr_title_prefix": true,
+    "pr_extra_rules": ["What 섹션은 파일 경로를 `백틱`으로 감싼다"],
+    "pr_checklist": ["로컬에서 실행해 봤다", "민감정보가 포함되지 않았다"]
+  }
+}
